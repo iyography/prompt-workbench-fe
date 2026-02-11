@@ -1,4 +1,5 @@
 import React from 'react';
+import Image from 'next/image';
 
 interface LogoProps {
   className?: string;
@@ -12,54 +13,31 @@ export const NarrativeLogo: React.FC<LogoProps> = ({
   size = 'md' 
 }) => {
   const sizeClasses = {
-    sm: 'h-6',
-    md: 'h-8', 
-    lg: 'h-12'
+    sm: variant === 'icon' ? 'h-6 w-6' : 'h-6 w-auto',
+    md: variant === 'icon' ? 'h-8 w-8' : 'h-8 w-auto', 
+    lg: variant === 'icon' ? 'h-12 w-12' : 'h-12 w-auto'
   };
 
   if (variant === 'icon') {
     return (
-      <svg 
-        className={`${sizeClasses[size]} w-auto text-narrative-green ${className}`} 
-        viewBox="0 0 32 40" 
-        fill="none" 
-        xmlns="http://www.w3.org/2000/svg"
-      >
-        <path 
-          d="M8 8V32L16 24V16L24 8V32" 
-          stroke="currentColor" 
-          strokeWidth="2" 
-          strokeLinecap="round" 
-          strokeLinejoin="round"
-        />
-      </svg>
+      <Image
+        src="/favico.svg"
+        alt="Narrative"
+        width={32}
+        height={32}
+        className={`${sizeClasses[size]} ${className}`}
+      />
     );
   }
 
   return (
-    <svg 
-      className={`${sizeClasses[size]} w-auto text-narrative-green ${className}`} 
-      viewBox="0 0 180 40" 
-      fill="none" 
-      xmlns="http://www.w3.org/2000/svg"
-    >
-      <path 
-        d="M8 8V32L16 24V16L24 8V32" 
-        stroke="currentColor" 
-        strokeWidth="2" 
-        strokeLinecap="round" 
-        strokeLinejoin="round"
-      />
-      <text 
-        x="40" 
-        y="26" 
-        className="fill-current font-sans font-normal" 
-        fontSize="18" 
-        letterSpacing="-0.02em"
-      >
-        Narrative
-      </text>
-    </svg>
+    <Image
+      src="/logo.svg"
+      alt="Narrative"
+      width={180}
+      height={40}
+      className={`${sizeClasses[size]} ${className}`}
+    />
   );
 };
 
