@@ -1,0 +1,1720 @@
+import {useEffect, useRef, useState} from "react";
+import {useQueryClient} from "@tanstack/react-query";
+import {Dictionary} from "lodash";
+import {Play, PlayOutputType, PlayStep, RunFinalPlayResponseType,} from "../../models/play";
+import {useBackendMutation, useBackendQuery} from "../../hooks/networking";
+import {useActiveTabUrl} from "../../hooks/chrome";
+import {
+    extractLinkedInProfileFromSalesNav,
+    getLinkedInUsernameFromUrl,
+    handleHubSpotProfileExtraction,
+    isHubSpotContactPage,
+    isSalesNavigatorProfile,
+} from "../../utils/linkedin";
+import {useCompanyAndProfileVariables} from "../../hooks/useCompanyAndProfileVariables";
+import {
+    useHubspotCompany,
+    useHubspotContact,
+    useHubspotDeal,
+    useHubspotEmployees,
+} from "../../hooks/useHubspot";
+import {flattenHubspotData, formatHubspotEmployees,} from "../../utils/formatting";
+import {isValidSmartVariableValue, requiredKeys} from "../../utils/llm";
+import {LinkedInProfile, LinkedInProfileBD,} from "../../models/linkedin-profile";
+import {CustomVariables, PlayResponse, SmartVariablesData,} from "../types/execute-view.types";
+import {formatString, prepareDataForPlay} from "@/utils/string-interpolation";
+import React from "react";
+import { levenshteinDistance } from "@/utils/levenshtein";
+import { useCompanyEnrichment } from "@/hooks/useCompanyEnrichment";
+import { useLinkedInJobs, useLinkedInPosts } from "@/hooks/useApify";
+import { useOrgChartMatching, getAccountIntelForResearch } from "@/hooks/useOrgChartMatching";
+
+const NARRATIVE_AI_AUTO_RUN = "narrative-ai-auto-run";
+
+interface PlayRanServerSide extends Play {
+    value: string;
+    name: string;
+}
+
+// Helper function to handle profile extraction
+const handleProfileExtraction = async (
+    extractFn: () => Promise<string | undefined>,
+    setIsScrapingProfile: (isScrapingProfile: boolean) => void,
+    processUsername: (username: string | undefined) => void,
+) => {
+    setIsScrapingProfile(true);
+    try {
+        const profileUrl = await extractFn();
+        if (profileUrl) {
+            const username = getLinkedInUsernameFromUrl(profileUrl);
+            processUsername(username);
+        }
+    } catch (error) {
+        console.error("Error extracting profile:", error);
+    } finally {
+        setIsScrapingProfile(false);
+    }
+};
+
+export function useExecuteView() {
+    console.log("🔍 useExecuteView hook called!");
+    console.log("🚨 HOOK START DEBUG - Testing if debug logs work at all");
+    const [totalTasksInitiated, setTotalTasksInitiated] = useState(0);
+    const [linkedInProfileFromEmail, setLinkedInProfileFromEmail] = useState<string | null | false>(null);
+    const [selectedPlay, setSelectedPlay] = useState<Play | undefined>(undefined);
+    const [isLoadingSmartVariablesFinal, setIsLoadingSmartVariablesFinal] =
+        useState(false);
+    const [playResponses, setPlayResponses] = useState<PlayResponse>({});
+    const [autoRun, setAutoRun] = useState(
+        localStorage.getItem(NARRATIVE_AI_AUTO_RUN) === "true",
+    );
+    // Add state to track if we've manually researched a profile
+    const [hasManuallyResearched, setHasManuallyResearched] = useState(false);
+    // Circuit breaker for preventing infinite execution loops
+    const [executionCount, setExecutionCount] = useState(0);
+    const maxExecutions = 50; // Increase limit - was too low at 10
+    const [smartVariablesData, setSmartVariablesData] =
+        useState<SmartVariablesData>({});
+    const [customVariables, setCustomVariables] = useState<CustomVariables>({});
+    const [currentUsername, setCurrentUsername] = useState<string | undefined>(
+        undefined,
+    );
+    const [showCopiedOnIndex, setShowCopiedOnIndex] = useState<number | null>(
+        null,
+    );
+    // Add state to store the email extracted from HubSpot page
+    const [extractedEmailFromHubSpot, setExtractedEmailFromHubSpot] = useState<string | undefined>(undefined);
+
+    // Create a derived state that indicates whether we should fetch data
+    const shouldFetchData = autoRun || hasManuallyResearched;
+    
+    // DEBUG: Log the crucial variables that control research execution
+    console.log('🎯 RESEARCH EXECUTION CONTROL:', {
+        autoRun,
+        hasManuallyResearched,
+        shouldFetchData,
+        'Research will execute?': shouldFetchData
+    });
+
+    const attemptsRef = useRef<Record<string, number>>({});
+
+    const [isScrapingProfile, setIsScrapingProfile] = useState(false);
+    const [pendingTasks, setPendingTasks] = useState<string[]>([]);
+
+    // Add research control state
+    const [isResearchStopped, setIsResearchStopped] = useState(false);
+
+    const url = useActiveTabUrl();
+    const client = useQueryClient();
+
+    // LinkedIn profile data fetching
+    const {
+        data: linkedInProfile,
+        isIdle: didDoResearch,
+        mutateAsync: fetchLinkedInProfileData,
+        isPending: isLinkedinProfileDataLoading,
+        error: linkedinProfileDataError,
+    } = useBackendMutation<LinkedInProfileBD, LinkedInProfile>(
+        "linkedin-profiles/",
+        "POST",
+        {
+            shouldCacheResponse: false,
+        },
+    );
+
+    // Wrap the original fetchLinkedInProfileData to track manual research
+    const fetchLinkedInProfileDataWithTracking = async (params: any) => {
+        console.log("Fetching LinkedIn profile data for:", params.profile_id);
+        // Mark as manually researched
+        setHasManuallyResearched(true);
+        return await fetchLinkedInProfileData(params);
+    };
+
+    const linkedin = linkedInProfile?.profile_data_raw;
+    
+    // Debug: Log the LinkedIn profile data
+    console.log("🔍 LinkedIn profile debug:", {
+        linkedInProfile: !!linkedInProfile,
+        profile_data_raw: !!linkedInProfile?.profile_data_raw,
+        profile_data: !!linkedInProfile?.profile_data,
+        profile_data_keys: linkedInProfile?.profile_data ? Object.keys(linkedInProfile.profile_data).length : 0,
+        profile_data_sample: linkedInProfile?.profile_data ? Object.keys(linkedInProfile.profile_data).slice(0, 5) : 'none',
+        linkedin: linkedin,
+        hasHeadline: !!linkedin?.headline,
+        headline: linkedin?.headline
+    });
+    
+    // Extract company name from LinkedIn data
+    const extractCompanyName = (profileData: any) => {
+        if (!profileData) return undefined;
+        
+        // Try to find company name in various possible fields
+        if (profileData.company_name) {
+            return profileData.company_name;
+        } else if (profileData.headline) {
+            // Extract company name from headline (e.g., "COO at ZeroBounce" -> "ZeroBounce")
+            const headline = profileData.headline;
+            const atIndex = headline.indexOf(' at ');
+            if (atIndex !== -1) {
+                return headline.substring(atIndex + 4).trim();
+            }
+        }
+        return undefined;
+    };
+    
+    const companyName = extractCompanyName(linkedin);
+    
+    // Debug: Log the company name extraction
+    console.log("🔍 Company name extraction debug:", {
+        linkedin: linkedin,
+        companyName: companyName,
+        hasHeadline: !!linkedin?.headline,
+        headline: linkedin?.headline
+    });
+
+    // Load all available research play templates (not executed yet)
+    const {
+        isLoading: isLoadingResearchPlays,
+        error: errorResearchPlays,
+        data: researchPlayTemplates,
+    } = useBackendQuery<Play[]>(
+        `plays/?output_type=variable`,
+        {
+            enabled: Boolean(shouldFetchData),
+        },
+    );
+
+    // Smart variables data fetching (keep for backward compatibility)
+    const {
+        isLoading: isLoadingSmartVariables,
+        error: errorSmartVariables,
+        data,
+    } = useBackendQuery<PlayRanServerSide[]>(
+        `smart-variables/?profile_id=${currentUsername}`,
+        {
+            enabled: Boolean(linkedInProfile && shouldFetchData),
+        },
+    );
+
+    // Use research play templates as primary source, fallback to executed smart variables
+    const smartVariablesDataInitial = (researchPlayTemplates && researchPlayTemplates.length > 0) 
+        ? researchPlayTemplates.map(play => ({ ...play, value: "" })) // Convert templates to format expected by execution logic
+        : (data || []);
+
+    // Debug: Log research plays loading
+    console.log('🔍 Research Plays Debug:', {
+        researchPlaysLoading: isLoadingResearchPlays,
+        researchPlaysCount: researchPlayTemplates?.length || 0,
+        researchPlayNames: researchPlayTemplates?.map(p => p.name) || [],
+        smartVariablesCount: smartVariablesDataInitial.length,
+        smartVariableNames: smartVariablesDataInitial.map(p => p.name)
+    });
+
+    // Company and profile variables
+    const {
+        profile,
+        data: companyAndUserVariables,
+        error: errorVariables,
+        isFetching: isLoadingVariables,
+    } = useCompanyAndProfileVariables();
+
+    // Plays data fetching
+    const {
+        data: p,
+        isLoading: isLoadingPlays,
+        error: errorPlays,
+    } = useBackendQuery<Play[]>(`plays/?output_type=${PlayOutputType.FINAL}`, {
+        enabled: shouldFetchData,
+    });
+    const plays = p || [];
+
+    // Required keys calculation
+    const allRequiredKeys = new Set<string>();
+    [...plays, ...smartVariablesDataInitial].forEach((play) => {
+        if (!play.visible) return;
+        const {requiredKeys: keys} = requiredKeys(play.play_steps);
+        keys.forEach((key) => allRequiredKeys.add(key));
+    });
+
+
+    // Hubspot data fetching
+    const {
+        data: hubspotContactData,
+        isLoading: loadingContact,
+        refetch: refetchHubspotContactData,
+        isFetching: isFetchingHubspotContactData,
+        isPending: isPendingHubspotContactData
+    } = useHubspotContact(
+        profile?.id,
+        // Matching strategy:
+        // 1. If we have extracted email from HubSpot page, use that (most accurate)
+        // 2. If we have LinkedIn profile data, use name + company from LinkedIn
+        // 3. Otherwise, no search parameters
+        extractedEmailFromHubSpot 
+            ? { email: extractedEmailFromHubSpot }  // Use extracted email for exact match
+            : (linkedInProfile?.profile_id === currentUsername && linkedin
+                ? {
+                    firstName: linkedin?.first_name,
+                    lastName: linkedin?.last_name,
+                    companyName: companyName, // Use extracted company name for more accurate matching
+                    // Note: CoreSignal doesn't provide email, so we use name + company matching
+                    // This ensures we get the same person from both systems
+                } : undefined),
+        {
+            enabled: callHubspot(),
+        },
+        currentUsername
+    );
+
+    function callHubspot(): boolean {
+        // Only call Hubspot if we have profile data AND either auto-run is enabled OR manual research was requested
+        const result = !!(profile?.id && shouldFetchData && (extractedEmailFromHubSpot || linkedin));
+        
+        // DEBUG: Log HubSpot call conditions
+        console.log('🔍 HUBSPOT DEBUG:', {
+            'profile.id': profile?.id,
+            shouldFetchData,
+            extractedEmailFromHubSpot,
+            'linkedin exists': !!linkedin,
+            'linkedin.first_name': linkedin?.first_name,
+            'linkedin.last_name': linkedin?.last_name,
+            'linkedin.email': linkedin?.email,
+            'companyName': companyName,
+            'currentUsername': currentUsername,
+            'linkedInProfile?.profile_id': linkedInProfile?.profile_id,
+            'callHubspot() result': result,
+            'search params': extractedEmailFromHubSpot 
+                ? { email: extractedEmailFromHubSpot }
+                : (linkedInProfile?.profile_id === currentUsername && linkedin
+                    ? { firstName: linkedin?.first_name, lastName: linkedin?.last_name, companyName: companyName }
+                    : undefined)
+        });
+        
+        return result;
+    }
+
+
+
+
+    const hubspotContact = hubspotContactData?.results?.data[0];
+    
+    // DEBUG: Log HubSpot contact data processing
+    console.log('🔍 HUBSPOT CONTACT PROCESSING DEBUG:', {
+        hubspotContactData: !!hubspotContactData,
+        results: !!hubspotContactData?.results,
+        data: !!hubspotContactData?.results?.data,
+        dataLength: hubspotContactData?.results?.data?.length,
+        firstContact: hubspotContactData?.results?.data?.[0],
+        hubspotContact: !!hubspotContact
+    });
+
+    // Get company ID from contact properties (check multiple possible formats)
+    const companyId = hubspotContact?.properties?.associatedcompanyid?.value || 
+                     hubspotContact?.properties?.associatedcompanyid ||
+                     hubspotContact?.properties?.hs_associatedcompanyid?.value ||
+                     hubspotContact?.properties?.hs_associatedcompanyid;
+
+    // Debug: Log the company ID and hook conditions
+    console.log("🔍 Deal hook debug:", {
+        companyId,
+        profileId: profile?.id,
+        shouldFetchData,
+        enabled: !!(companyId && profile?.id && shouldFetchData),
+        hubspotContact: !!hubspotContact,
+        contactProperties: hubspotContact?.properties,
+        // Log the actual contact structure
+        contactKeys: hubspotContact ? Object.keys(hubspotContact) : [],
+        propertiesKeys: hubspotContact?.properties ? Object.keys(hubspotContact.properties) : []
+    });
+
+    // Stable hook conditions to prevent hook order violations
+    const shouldCallHubspot = callHubspot();
+    const hubspotContactFinished = !isPendingHubspotContactData;
+    const hasValidHubspotContact = !!hubspotContact?.id;
+
+    const {
+        data: hubspotEmployeesData,
+        error: hubspotEmployeesError,
+        isLoading: loadingEmployees,
+        refetch: refetchHubspotEmployeesData,
+        isPending: isPendingHubspotEmployeesData,
+        isFetching: isFetchingHubspotEmployeesData,
+    } = useHubspotEmployees(
+        profile?.id,
+        companyId ? String(companyId) : undefined,
+        {
+            enabled:
+                !!(profile?.id && shouldFetchData && shouldCallHubspot && hubspotContactFinished && hasValidHubspotContact),
+        },
+        currentUsername
+    );
+
+    const hubspotEmployees = hubspotEmployeesData?.results.data;
+
+    // Extract company ID from LinkedIn profile data for Company Enrichment
+    const extractCompanyIdFromProfile = (profileData: any): string | undefined => {
+        if (!profileData) return undefined;
+        
+        // Check if active_experience_company_id is directly available
+        if (profileData.active_experience_company_id) {
+            return String(profileData.active_experience_company_id);
+        }
+        
+        // Check in experience array for the most recent experience
+        if (profileData.experience && Array.isArray(profileData.experience)) {
+            for (const exp of profileData.experience) {
+                if (exp && typeof exp === 'object' && exp.company_id) {
+                    return String(exp.company_id);
+                }
+            }
+        }
+        
+        return undefined;
+    };
+    
+    const linkedInCompanyId = extractCompanyIdFromProfile(linkedin);
+    
+    // DEBUG: Company Enrichment loading conditions
+    console.log('🏢 Company Enrichment Debug:');
+    console.log('  linkedInCompanyId:', linkedInCompanyId);
+    console.log('  companyId:', companyId);
+    console.log('  finalCompanyId:', linkedInCompanyId || (companyId ? String(companyId) : undefined));
+    console.log('  enabled:', !!(linkedInCompanyId || companyId));
+    console.log('  linkedin:', !!linkedin);
+    console.log('  hubspotContact:', !!hubspotContact);
+    
+    // Company Enrichment (CoreSignal) – use LinkedIn company ID if available, fallback to HubSpot company ID
+    const { data: companyEnrichment, isLoading: isLoadingCompanyEnrichment } = useCompanyEnrichment(
+        linkedInCompanyId || (companyId ? String(companyId) : undefined),
+        !!(linkedInCompanyId || companyId)
+    );
+    // Extract company name from Company Enrichment data (preferred source)
+    let enrichmentCompanyName: string | undefined = (companyEnrichment?.data as any)?.name || 
+                                                    (companyEnrichment?.data as any)?.company_name || 
+                                                    (companyEnrichment?.data as any)?.companyName ||
+                                                    (companyEnrichment as any)?.company_name || 
+                                                    (companyEnrichment as any)?.company_company_name;
+    
+    // Fallback: Extract company name from LinkedIn URL if available
+    if (!enrichmentCompanyName && companyEnrichment?.data?.linkedin_url) {
+        const linkedInUrl = companyEnrichment.data.linkedin_url;
+        const companySlugMatch = linkedInUrl.match(/linkedin\.com\/company\/([^\/\?]+)/);
+        if (companySlugMatch) {
+            // Convert company slug to proper name (e.g., "amazon" -> "Amazon")
+            enrichmentCompanyName = companySlugMatch[1].charAt(0).toUpperCase() + companySlugMatch[1].slice(1);
+        }
+    }
+    
+    // Debug: Log Company Enrichment data
+    React.useEffect(() => {
+        if (companyEnrichment) {
+            console.log("🏢 Company Enrichment data loaded:", companyEnrichment);
+            console.log("🏢 Company Enrichment flattened:", flattenCompanyEnrichmentData(companyEnrichment));
+            console.log("🏢 Enrichment company name extracted:", enrichmentCompanyName);
+        }
+    }, [companyEnrichment, enrichmentCompanyName]);
+
+    // Apify LinkedIn Posts - get posts from current LinkedIn profile  
+    const currentLinkedInUrl = currentUsername ? `https://www.linkedin.com/in/${currentUsername}/` : '';
+    
+    // DEBUG: LinkedIn Posts loading conditions
+    console.log('📝 LinkedIn Posts Debug:');
+    console.log('  currentUsername:', currentUsername);
+    console.log('  shouldFetchData:', shouldFetchData);
+    console.log('  linkedInProfile:', !!linkedInProfile);
+    console.log('  currentLinkedInUrl:', currentLinkedInUrl);
+    console.log('  enabled:', !!(currentUsername && shouldFetchData && linkedInProfile));
+    
+    const { data: linkedInPostsData, isLoading: isLoadingLinkedInPosts, error: linkedInPostsError } = useLinkedInPosts(
+        currentLinkedInUrl,
+        10,
+        {
+            enabled: !!(currentUsername && shouldFetchData && linkedInProfile),
+        }
+    );
+    
+    // DEBUG: LinkedIn Posts result
+    console.log('📝 LinkedIn Posts Result:');
+    console.log('  isLoading:', isLoadingLinkedInPosts);
+    console.log('  hasData:', !!linkedInPostsData);
+    console.log('  error:', linkedInPostsError);
+    console.log('  data:', linkedInPostsData);
+    
+    // Debug: Log LinkedIn Posts data
+    React.useEffect(() => {
+        if (linkedInPostsData) {
+            console.log("📝 LinkedIn Posts data loaded:", linkedInPostsData);
+            console.log("📝 LinkedIn Posts flattened:", flattenLinkedInPostsData(linkedInPostsData));
+        }
+    }, [linkedInPostsData]);
+
+
+    // Apify LinkedIn Jobs - get jobs for the verified company name
+    const verifiedCompanyName = enrichmentCompanyName || companyName;
+    // Use broader search terms to find more relevant jobs
+    const jobSearchQuery = 'Account Executive OR "Sales Development Representative" OR "Business Development"';
+    
+    // DEBUG: LinkedIn Jobs loading conditions
+    console.log('💼 LinkedIn Jobs Debug:');
+    console.log('  companyName:', companyName);
+    console.log('  enrichmentCompanyName:', enrichmentCompanyName);
+    console.log('  verifiedCompanyName:', verifiedCompanyName);
+    console.log('  jobSearchQuery:', jobSearchQuery);
+    console.log('  shouldFetchData:', shouldFetchData);
+    console.log('  linkedInProfile:', !!linkedInProfile);
+    console.log('  enabled:', !!(verifiedCompanyName && shouldFetchData && linkedInProfile));
+    
+    const { data: linkedInJobsData, isLoading: isLoadingLinkedInJobs, error: linkedInJobsError } = useLinkedInJobs(
+        {
+            searchQuery: jobSearchQuery,
+            location: 'United States', 
+            jobType: 'full-time',
+            experienceLevel: 'mid-senior',
+            verifiedCompanyName: verifiedCompanyName // This filters jobs to only the specific company
+        },
+        {
+            enabled: !!(verifiedCompanyName && shouldFetchData && linkedInProfile),
+        }
+    );
+    
+    // DEBUG: LinkedIn Jobs result
+    console.log('💼 LinkedIn Jobs Result:');
+    console.log('  isLoading:', isLoadingLinkedInJobs);
+    console.log('  hasData:', !!linkedInJobsData);
+    console.log('  error:', linkedInJobsError);
+    console.log('  data:', linkedInJobsData);
+    
+    // Debug: Log LinkedIn Jobs data
+    React.useEffect(() => {
+        if (linkedInJobsData) {
+            console.log("💼 LinkedIn Jobs data loaded:", linkedInJobsData);
+            console.log("💼 LinkedIn Jobs flattened:", flattenLinkedInJobsData(linkedInJobsData));
+        }
+    }, [linkedInJobsData]);
+
+    const {
+        data: hubspotDealData,
+        isLoading: loadingDeal,
+        refetch: refetchHubspotDealData,
+        isFetching: isFetchingHubspotDealData,
+        isPending: isPendingHubspotDealData,
+    } = useHubspotDeal(
+        profile?.id, // connectionId - same as other HubSpot hooks
+        undefined, // contactId - not using contact-based deals anymore
+        undefined, // companyId - not using company ID
+        companyName, // Use extracted company name
+        {
+            enabled: !!(profile?.id && companyName && shouldFetchData),
+        },
+        currentUsername
+    );
+
+    // Prefer enrichment company name for matching if available
+    const effectiveCoreSignalCompanyName = enrichmentCompanyName || companyName;
+    
+    // NEW: Org Chart Matching - Match company to org charts for account intel
+    const companyEnrichmentWebsite = companyEnrichment?.data?.website || (companyEnrichment?.data as any)?.company_website;
+    const {
+        match: orgChartMatch,
+        isLoading: isLoadingOrgCharts,
+        hasMatch: hasOrgChartMatch,
+        matchConfidence: orgChartMatchConfidence,
+        matchType: orgChartMatchType,
+        accountIntel: orgChartAccountIntel
+    } = useOrgChartMatching(
+        companyEnrichmentWebsite,
+        effectiveCoreSignalCompanyName,
+        shouldFetchData // Only fetch when research is enabled
+    );
+    
+    // DEBUG: Org Chart matching
+    console.log('🏢 ORG CHART MATCHING DEBUG:', {
+        companyEnrichmentWebsite,
+        effectiveCoreSignalCompanyName,
+        hasMatch: hasOrgChartMatch,
+        matchType: orgChartMatchType,
+        confidence: orgChartMatchConfidence,
+        accountIntel: orgChartAccountIntel ? 'Available' : 'None'
+    });
+
+    const {
+        data: hubspotCompanyData,
+        isLoading: loadingHubspotCompany,
+        refetch: refetchHubspotCompanyData,
+        isFetching: isFetchingHubspotCompanyData,
+        isPending: isPendingHubspotCompanyData,
+    } = useHubspotCompany(
+        profile?.id,
+        companyId ? String(companyId) : undefined,
+        {
+            enabled: !!(profile?.id && shouldFetchData && shouldCallHubspot && hubspotContactFinished && hasValidHubspotContact),
+        },
+        currentUsername
+    );
+
+    const hubspotCompany = hubspotCompanyData?.results?.data?.[0];
+
+    // Fuzzy company match: compare CoreSignal (LinkedIn/CoreSignal-derived) vs HubSpot company name
+    const normalizeCompanyName = (name?: string): string => {
+        return (name || "")
+            .toLowerCase()
+            .replace(/[,\.]/g, " ")
+            .replace(/\b(inc|incorporated|llc|l\.l\.c|ltd|limited|co|corp|corporation|sa|gmbh|ag|plc)\b/g, "")
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+
+    const isFuzzyMatch = (a?: string, b?: string): boolean => {
+        const na = normalizeCompanyName(a);
+        const nb = normalizeCompanyName(b);
+        if (!na || !nb) return false;
+        if (na === nb) return true;
+        if (na.length >= 4 && nb.includes(na)) return true;
+        if (nb.length >= 4 && na.includes(nb)) return true;
+        const dist = levenshteinDistance(na, nb);
+        const ratio = dist / Math.max(na.length, nb.length);
+        return ratio <= 0.25; // allow small differences
+    }
+
+    const coreSignalCompanyName = effectiveCoreSignalCompanyName; // prefer enrichment when available
+    const rawHubspotName: any = hubspotCompany?.properties?.name?.value ?? hubspotCompany?.properties?.name;
+    const hubspotCompanyName: string | undefined = typeof rawHubspotName === 'string' ? rawHubspotName : undefined;
+    const companyNamesMatch = isFuzzyMatch(coreSignalCompanyName, hubspotCompanyName);
+
+    if (hubspotCompanyName) {
+        console.log("🔎 Company match check:", { coreSignalCompanyName, hubspotCompanyName, companyNamesMatch });
+    }
+
+    // Debug logging for HubSpot matching
+    React.useEffect(() => {
+        if (linkedin && linkedInProfile?.profile_id === currentUsername) {
+            console.log("🔍 LinkedIn data for HubSpot matching:", {
+                firstName: linkedin?.first_name,
+                lastName: linkedin?.last_name,
+                companyName: companyName,
+                email: linkedin?.email
+            });
+        }
+    }, [linkedin, linkedInProfile, currentUsername, companyName]);
+
+    React.useEffect(() => {
+        if (hubspotContactData) {
+            console.log("📊 HubSpot contact search results:", {
+                totalResults: hubspotContactData?.results?.data?.length || 0,
+                firstContact: hubspotContactData?.results?.data?.[0]
+            });
+        }
+    }, [hubspotContactData]);
+
+    React.useEffect(() => {
+        if (hubspotContact) {
+            console.log("👤 HubSpot contact found:", {
+                id: hubspotContact.id,
+                firstName: hubspotContact.firstname,
+                lastName: hubspotContact.lastname,
+                email: hubspotContact.email,
+                properties: hubspotContact.properties
+            });
+        }
+    }, [hubspotContact]);
+
+    React.useEffect(() => {
+        // Check for company ID in different possible formats
+        const companyId = hubspotContact?.properties?.associatedcompanyid?.value || 
+                         hubspotContact?.properties?.associatedcompanyid ||
+                         hubspotContact?.properties?.hs_associatedcompanyid?.value ||
+                         hubspotContact?.properties?.hs_associatedcompanyid;
+        
+        if (companyId) {
+            console.log("🏢 Company ID for deal lookup:", companyId);
+        } else {
+            console.log("⚠️ No company ID found in contact properties:", hubspotContact?.properties);
+            // Log all available properties to find the correct company field
+            if (hubspotContact?.properties) {
+                console.log("🔍 All contact properties:", Object.keys(hubspotContact.properties));
+                // Look for any property that might contain company info
+                Object.entries(hubspotContact.properties).forEach(([key, value]) => {
+                    if (key.toLowerCase().includes('company') || key.toLowerCase().includes('org')) {
+                        console.log(`🏢 Potential company field "${key}":`, value);
+                    }
+                });
+            }
+        }
+        
+        // Debug: Log the entire contact object to see its structure
+        if (hubspotContact) {
+            console.log("🔍 Full contact object structure:", hubspotContact);
+            console.log("🔍 Contact properties:", hubspotContact.properties);
+            console.log("🔍 Associated company ID:", hubspotContact.properties?.associatedcompanyid);
+            console.log("🔍 HS Associated company ID:", hubspotContact.properties?.hs_associatedcompanyid);
+        }
+    }, [hubspotContact]);
+
+    React.useEffect(() => {
+        if (hubspotDealData) {
+            console.log("💼 HubSpot deal data:", {
+                deal: hubspotDealData?.deal,
+                hasDeal: !!hubspotDealData?.deal
+            });
+        }
+    }, [hubspotDealData]);
+
+    React.useEffect(() => {
+        if (hubspotContact?.id) {
+            console.log("🔗 Contact ID for deal lookup:", hubspotContact.id);
+        }
+    }, [hubspotContact]);
+
+    // Play execution
+    const {
+        mutateAsync: _runPlay,
+        isPending: isLoadingRun,
+        error: runError,
+    } = useBackendMutation<
+        {
+            external_data: Record<string, string>;
+            persona_data: Dictionary<string[]>;
+            playId: number;
+        },
+        RunFinalPlayResponseType
+    >(({playId}) => `plays/${playId}/run/`, "PUT");
+
+    const {mutateAsync: runSmartPlay} = useBackendMutation<
+        {
+            external_data: Record<string, string>;
+            persona_data: Dictionary<string[]>;
+            playId: number;
+        },
+        RunFinalPlayResponseType
+    >(({playId}) => `plays/${playId}/run/`, "PUT");
+
+    // Data processing
+    const [detectedPersonaName, persona] = Object.entries(
+        linkedInProfile?.persona || {},
+    )?.[0] || ["", {}];
+    const smartVariables = smartVariablesDataInitial.reduce<Dictionary<string>>(
+        (acc, sv) => ({
+            ...acc,
+            [sv.name]: sv.value || "", // Convert null to empty string
+        }),
+        {},
+    );
+
+    const personaData = {
+        ...persona,
+        ...companyAndUserVariables,
+    };
+
+    let variablesForAllPlays: Record<string, string> = {};
+    plays.forEach(
+        ({variables}) => {
+            // Filter out null/undefined values from variables
+            const filteredVariables = Object.fromEntries(
+                Object.entries(variables).filter(([_, value]) => value != null)
+            );
+            variablesForAllPlays = {...variablesForAllPlays, ...filteredVariables};
+        }
+    );
+
+    // Helper function to flatten Company Enrichment data
+    function flattenCompanyEnrichmentData(enrichmentData: any): Record<string, string> {
+        const flattened: Record<string, string> = {};
+        
+        if (!enrichmentData?.data) return flattened;
+        
+        const data = enrichmentData.data;
+        
+        // Map common Company Enrichment fields - try multiple possible name fields
+        if (data.name) flattened.company_enrichment_name = data.name;
+        if (data.company_name) flattened.company_enrichment_company_name = data.company_name;
+        if (data.companyName) flattened.company_enrichment_companyName = data.companyName;
+        if (data.description) flattened.company_enrichment_description = data.description;
+        if (data.industry) flattened.company_enrichment_industry = data.industry;
+        if (data.size) flattened.company_enrichment_size = String(data.size);
+        if (data.website) flattened.company_enrichment_website = data.website;
+        if (data.founded) flattened.company_enrichment_founded = String(data.founded);
+        if (data.headquarters) flattened.company_enrichment_headquarters = data.headquarters;
+        if (data.specialties) flattened.company_enrichment_specialties = data.specialties;
+        if (data.employee_count) flattened.company_enrichment_employee_count = String(data.employee_count);
+        if (data.linkedin_url) flattened.company_enrichment_linkedin_url = data.linkedin_url;
+        
+        return flattened;
+    }
+
+    // Helper function to flatten LinkedIn Posts data  
+    function flattenLinkedInPostsData(postsData: any): Record<string, string> {
+        const flattened: Record<string, string> = {};
+        
+        if (!postsData?.data || !Array.isArray(postsData.data)) return flattened;
+        
+        const posts = postsData.data.slice(0, 5); // Limit to 5 posts
+        
+        flattened.linkedin_posts_count = String(posts.length);
+        
+        posts.forEach((post: any, index: number) => {
+            const idx = index + 1;
+            if (post.text) flattened[`linkedin_post_${idx}_text`] = post.text;
+            if (post.posted_at?.date) flattened[`linkedin_post_${idx}_date`] = post.posted_at.date;
+            if (post.posted_at?.relative) flattened[`linkedin_post_${idx}_relative_date`] = post.posted_at.relative;
+            if (post.likes) flattened[`linkedin_post_${idx}_likes`] = String(post.likes);
+            if (post.comments) flattened[`linkedin_post_${idx}_comments`] = String(post.comments);
+            if (post.shares) flattened[`linkedin_post_${idx}_shares`] = String(post.shares);
+        });
+        
+        // Latest post convenience variables
+        if (posts.length > 0) {
+            flattened.linkedin_latest_post_text = flattened.linkedin_post_1_text || '';
+            flattened.linkedin_latest_post_date = flattened.linkedin_post_1_date || '';
+        }
+        
+        return flattened;
+    }
+
+    // Helper function to flatten LinkedIn Jobs data
+    function flattenLinkedInJobsData(jobsData: any): Record<string, string> {
+        const flattened: Record<string, string> = {};
+        
+        if (!jobsData?.data || !Array.isArray(jobsData.data)) return flattened;
+        
+        const jobs = jobsData.data.slice(0, 5); // Limit to 5 jobs
+        
+        flattened.linkedin_jobs_count = String(jobs.length);
+        flattened.linkedin_jobs_company = jobsData.searchParams?.company || '';
+        
+        jobs.forEach((job: any, index: number) => {
+            const idx = index + 1;
+            if (job.job_title || job.title) flattened[`linkedin_jobs_${idx}_title`] = job.job_title || job.title;
+            if (job.company_name || job.company) flattened[`linkedin_jobs_${idx}_company`] = job.company_name || job.company;
+            if (job.job_location || job.location) flattened[`linkedin_jobs_${idx}_location`] = job.job_location || job.location;
+            if (job.url || job.linkedinUrl) flattened[`linkedin_jobs_${idx}_url`] = job.url || job.linkedinUrl;
+            if (job.job_posted_date || job.postedDate) flattened[`linkedin_jobs_${idx}_posted_date`] = job.job_posted_date || job.postedDate;
+            if (job.job_summary || job.description) flattened[`linkedin_jobs_${idx}_description`] = job.job_summary || job.description;
+        });
+        
+        // Latest job convenience variables
+        if (jobs.length > 0) {
+            flattened.linkedin_latest_job_title = flattened.linkedin_jobs_1_title || '';
+            flattened.linkedin_latest_job_company = flattened.linkedin_jobs_1_company || '';
+        }
+        
+        return flattened;
+    }
+
+    // Guaranteed variables functions for each data source (batches)
+    function guaranteedLinkedInProfileVar(): Record<string, string> {
+        // Batch 1: LinkedIn Profile is guaranteed when we have profile data and it's not loading
+        if (!isLinkedinProfileDataLoading && linkedInProfile) {
+            return { linkedin_profile_guaranteed: "complete" };
+        }
+        return { linkedin_profile_guaranteed: "loading" };
+    }
+
+    function guaranteedCompanyEnrichmentVar(): Record<string, string> {
+        // Batch 2: Company Enrichment is guaranteed when enrichment call is done (regardless of data)
+        if (!isLoadingCompanyEnrichment) {
+            console.log('✅ Batch 2 (Company Enrichment) COMPLETE - returning guaranteed variable');
+            return { company_enrichment_guaranteed: "complete" };
+        }
+        console.log('⏳ Batch 2 (Company Enrichment) LOADING');
+        return { company_enrichment_guaranteed: "loading" };
+    }
+
+    function guaranteedHubspotVar(): Record<string, string> {
+        // Batch 3: HubSpot is guaranteed when HubSpot contact call is finished
+        // (Other HubSpot calls depend on contact, so we only wait for contact to finish)
+        if (!callHubspot()) {
+            // If HubSpot is disabled, mark as no_data immediately
+            return { hubspot_guaranteed: "no_data" };
+        }
+        
+        if (!isPendingHubspotContactData) {
+            // Check if we have any HubSpot data at all
+            const hasContactData = !!hubspotContact;
+            const hasCompanyData = !!hubspotCompany;
+            const hasDealData = !!hubspotDealData?.deal;
+            const hasEmployeeData = !!hubspotEmployees;
+            
+            const hasAnyHubspotData = hasContactData || hasCompanyData || hasDealData || hasEmployeeData;
+            
+            console.log('🔍 HubSpot guaranteed check:', {
+                hasContactData,
+                hasCompanyData, 
+                hasDealData,
+                hasEmployeeData,
+                hasAnyHubspotData,
+                isPendingContact: isPendingHubspotContactData
+            });
+            
+            // TEMP FIX: Force HubSpot batch to complete even if no contact found
+            // This allows research plays to proceed
+            return { hubspot_guaranteed: "complete" };
+        }
+        return { hubspot_guaranteed: "loading" };
+    }
+
+    function guaranteedLinkedInPostsVar(): Record<string, string> {
+        // Batch 4: LinkedIn Posts is guaranteed when posts call is done (regardless of data)
+        if (!isLoadingLinkedInPosts) {
+            console.log('✅ Batch 4 (LinkedIn Posts) COMPLETE - returning guaranteed variable');
+            return { linkedin_posts_guaranteed: "complete" };
+        }
+        console.log('⏳ Batch 4 (LinkedIn Posts) LOADING');
+        return { linkedin_posts_guaranteed: "loading" };
+    }
+
+    function guaranteedLinkedInJobsVar(): Record<string, string> {
+        // Batch 5: LinkedIn Jobs is guaranteed when jobs call is done (regardless of data)
+        if (!isLoadingLinkedInJobs) {
+            console.log('✅ Batch 5 (LinkedIn Jobs) COMPLETE - returning guaranteed variable');
+            return { linkedin_jobs_guaranteed: "complete" };
+        }
+        console.log('⏳ Batch 5 (LinkedIn Jobs) LOADING');
+        return { linkedin_jobs_guaranteed: "loading" };
+    }
+
+    const allData: Record<string, string> = {
+        ...variablesForAllPlays,
+        ...linkedInProfile?.profile_data,
+        ...smartVariables,
+        ...smartVariablesData,
+        ...customVariables,
+        // Eagerly fetched, but only exposed when verified
+        ...flattenHubspotData("Deal", companyNamesMatch ? (hubspotDealData?.deal || null) : null),
+        ...flattenHubspotData("Contact", hubspotContact || null),
+        ...flattenHubspotData("Company", companyNamesMatch ? (hubspotCompany || null) : null),
+        ...(hubspotEmployees && companyNamesMatch ? formatHubspotEmployees(hubspotEmployees) : {}),
+        hubspot_company_match_status: companyNamesMatch ? "matched" : "mismatch",
+        // NEW: Add Company Enrichment, LinkedIn Posts, and LinkedIn Jobs data
+        ...flattenCompanyEnrichmentData(companyEnrichment),
+        ...flattenLinkedInPostsData(linkedInPostsData),
+        ...flattenLinkedInJobsData(linkedInJobsData),
+        // NEW: Add Org Chart matching data for research
+        ...getAccountIntelForResearch(orgChartMatch),
+        // GUARANTEED VARIABLES: Batch completion indicators
+        ...guaranteedLinkedInProfileVar(),      // Batch 1
+        ...guaranteedCompanyEnrichmentVar(),    // Batch 2  
+        ...guaranteedHubspotVar(),              // Batch 3
+        ...guaranteedLinkedInPostsVar(),        // Batch 4
+        ...guaranteedLinkedInJobsVar(),         // Batch 5
+    };
+
+    // DEBUG: Log guaranteed variables status
+    const guaranteedVars = {
+        batch1_linkedin: guaranteedLinkedInProfileVar(),
+        batch2_company: guaranteedCompanyEnrichmentVar(),
+        batch3_hubspot: guaranteedHubspotVar(),
+        batch4_posts: guaranteedLinkedInPostsVar(),
+        batch5_jobs: guaranteedLinkedInJobsVar()
+    };
+    console.log('🔍 GUARANTEED VARIABLES STATUS:');
+    Object.entries(guaranteedVars).forEach(([key, value]) => {
+        console.log(`  ${key}:`, value);
+    });
+
+
+    
+    // DEBUG: Loading states for all data sources
+    const loadingStates = {
+        linkedin_profile: !isLinkedinProfileDataLoading,
+        company_enrichment: !isLoadingCompanyEnrichment,
+        hubspot_contact: !isPendingHubspotContactData,
+        hubspot_deal: !isPendingHubspotDealData,
+        hubspot_company: !isPendingHubspotCompanyData,
+        hubspot_employees: !isPendingHubspotEmployeesData,
+        linkedin_posts: !isLoadingLinkedInPosts,
+        linkedin_jobs: !isLoadingLinkedInJobs
+    };
+    console.log('🔍 DATA SOURCE LOADING STATES:');
+    Object.entries(loadingStates).forEach(([key, value]) => {
+        console.log(`  ${key}: ${value ? '✅ LOADED' : '⏳ LOADING'}`);
+    });
+    
+    // DEBUG: Data availability
+    const dataAvailability = {
+        linkedin_profile_data: !!linkedInProfile,
+        company_enrichment_data: !!companyEnrichment,
+        hubspot_contact_data: !!hubspotContact,
+        hubspot_company_data: !!hubspotCompany,
+        hubspot_deal_data: !!hubspotDealData,
+        hubspot_employees_data: !!hubspotEmployees,
+        linkedin_posts_data: !!linkedInPostsData,
+        linkedin_jobs_data: !!linkedInJobsData
+    };
+    console.log('🔍 DATA AVAILABILITY:');
+    Object.entries(dataAvailability).forEach(([key, value]) => {
+        console.log(`  ${key}: ${value ? '✅ HAS DATA' : '❌ NO DATA'}`);
+    });
+
+    // Debug: Log batch system status and data counts (AFTER allData is defined)
+    React.useEffect(() => {
+        const linkedInProfileFields = Object.keys(allData).filter(k => k.startsWith('linkedin_') && !k.includes('guaranteed')).length;
+        const companyEnrichmentFields = Object.keys(allData).filter(k => k.startsWith('company_enrichment_')).length;
+        const hubspotFields = Object.keys(allData).filter(k => k.startsWith('hubspot_')).length;
+        const postsFields = Object.keys(allData).filter(k => k.includes('linkedin_post_')).length;
+        const jobsFields = Object.keys(allData).filter(k => k.includes('linkedin_jobs_')).length;
+        
+        console.log('📊 BATCH SYSTEM STATUS & DATA COUNTS:', {
+            'Batch 1 (LinkedIn Profile)': `${allData.linkedin_profile_guaranteed || 'loading'} - ${linkedInProfileFields} fields`,
+            'Batch 2 (Company Enrichment)': `${allData.company_enrichment_guaranteed || 'loading'} - ${companyEnrichmentFields} fields`,
+            'Batch 3 (HubSpot)': `${allData.hubspot_guaranteed || 'loading'} - ${hubspotFields} fields`,
+            'Batch 4 (LinkedIn Posts)': `${allData.linkedin_posts_guaranteed || 'loading'} - ${postsFields} fields`,
+            'Batch 5 (LinkedIn Jobs)': `${allData.linkedin_jobs_guaranteed || 'loading'} - ${jobsFields} fields`,
+            'TOTAL DATA FIELDS': Object.keys(allData).length
+        });
+        
+        // CRITICAL DEBUG: Check if basic LinkedIn fields exist
+        console.log('🔍 CRITICAL VARIABLES CHECK:', {
+            summary: allData.summary ? 'EXISTS' : 'MISSING',
+            experience: allData.experience ? 'EXISTS' : 'MISSING', 
+            education: allData.education ? 'EXISTS' : 'MISSING',
+            first_name: allData.first_name ? 'EXISTS' : 'MISSING',
+            last_name: allData.last_name ? 'EXISTS' : 'MISSING',
+            headline: allData.headline ? 'EXISTS' : 'MISSING'
+        });
+        
+        // APIFY DEBUG: Check if posts/jobs data exists
+        console.log('🔍 APIFY DATA CHECK:', {
+            isLoadingPosts: isLoadingLinkedInPosts,
+            postsData: !!linkedInPostsData,
+            postsError: linkedInPostsError,
+            isLoadingJobs: isLoadingLinkedInJobs, 
+            jobsData: !!linkedInJobsData,
+            jobsError: linkedInJobsError
+        });
+        
+        // Show sample of available data
+        console.log('🔍 AVAILABLE DATA SAMPLE:', Object.keys(allData).slice(0, 20));
+        
+    }, [allData, isLoadingLinkedInPosts, linkedInPostsData, linkedInPostsError, isLoadingLinkedInJobs, linkedInJobsData, linkedInJobsError]);
+
+    const cleanDataForLLM = (data: Record<string, string>): Record<string, string> => {
+        return Object.entries(data).reduce((acc, [key, value]) => {
+
+            if (value && value !== "nothing" && !value.includes("⛔️") && value !== "") {
+                acc[key] = value;
+            }
+            return acc;
+        }, {} as Record<string, string>);
+    };
+    const keysForPlay = (play: Play) => {
+        const {requiredKeys: required} = requiredKeys(play.play_steps);
+        return required.filter((k) => !personaData[k]);
+    };
+
+    function checkIfMentionsHubspotInStepVariables(str: string, variables: Record<string, string>): boolean {
+        const {replacedVariables} = formatString(str, variables);
+        return !!replacedVariables.find(v => v.name.startsWith('hubspot_'))
+    }
+
+    function checkIfMentionsHubspotInStep(play: PlayStep, variables: Record<string, string>): boolean {
+        return checkIfMentionsHubspotInStepVariables(play.system_instructions_template ?? '', variables)
+            || checkIfMentionsHubspotInStepVariables(play.user_instructions_template ?? '', variables);
+    }
+
+    function checkIfPlayMentionsHubspotAnywhereInItsSteps(play: Play, variables: Record<string, string>): boolean {
+        for (const step of play.play_steps) {
+            if (checkIfMentionsHubspotInStep(step, variables)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Batch system: Determine which batches are required for a play
+    const getRequiredBatchesForPlay = (play: Play): number[] => {
+        // Use API-provided batch requirements if available (from batch management)
+        if (play.required_batches && play.required_batches.length > 0) {
+            console.log(`🎯 Using API-provided batch requirements for play "${play.name}":`, play.required_batches);
+            return play.required_batches;
+        }
+        
+        // Fallback to text-based detection for backward compatibility
+        console.log(`📝 Using text-based batch detection for play "${play.name}"`);
+        const requiredBatches = [];
+        const playStepsText = play.play_steps.map(step => 
+            (step.system_instructions_template || '') + (step.user_instructions_template || '')
+        ).join(' ').toLowerCase();
+
+        // Batch 1: LinkedIn Profile - required if play mentions LinkedIn profile data
+        if (playStepsText.includes('linkedin_') || playStepsText.includes('first_name') || 
+            playStepsText.includes('last_name') || playStepsText.includes('headline')) {
+            requiredBatches.push(1);
+        }
+
+        // Batch 2: Company Enrichment - required if play mentions company enrichment data
+        if (playStepsText.includes('company_enrichment_') || playStepsText.includes('company_name') || 
+            playStepsText.includes('company_industry') || playStepsText.includes('website') ||
+            playStepsText.includes('description')) {
+            requiredBatches.push(2);
+        }
+
+        // Batch 3: HubSpot - required if play mentions HubSpot data
+        if (playStepsText.includes('hubspot_') || checkIfPlayMentionsHubspotAnywhereInItsSteps(play, allData)) {
+            requiredBatches.push(3);
+        }
+
+        // Batch 4: LinkedIn Posts - required if play mentions LinkedIn posts
+        if (playStepsText.includes('linkedin_post_') || playStepsText.includes('linkedin_posts_')) {
+            requiredBatches.push(4);
+        }
+
+        // Batch 5: LinkedIn Jobs - required if play mentions LinkedIn jobs
+        if (playStepsText.includes('linkedin_job_') || playStepsText.includes('linkedin_jobs_')) {
+            requiredBatches.push(5);
+        }
+
+        console.log(`📝 Text-based detection found batches:`, requiredBatches);
+        return requiredBatches;
+    };
+
+    // Check if required batches are available
+    const areBatchesAvailable = (requiredBatches: number[]): boolean => {
+        // If no batches are required, return true (empty requirement)
+        if (!requiredBatches || requiredBatches.length === 0) {
+            return true;
+        }
+
+        for (const batchNumber of requiredBatches) {
+            let batchGuaranteedVar = '';
+            switch (batchNumber) {
+                case 1: batchGuaranteedVar = 'linkedin_profile_guaranteed'; break;
+                case 2: batchGuaranteedVar = 'company_enrichment_guaranteed'; break;
+                case 3: batchGuaranteedVar = 'hubspot_guaranteed'; break;
+                case 4: batchGuaranteedVar = 'linkedin_posts_guaranteed'; break;
+                case 5: batchGuaranteedVar = 'linkedin_jobs_guaranteed'; break;
+            }
+            
+            const batchStatus = allData[batchGuaranteedVar];
+            
+            // Batch is available if it's "complete" or "no_data" (finished loading)
+            // Still loading if "loading" or undefined
+            if (batchStatus === 'loading' || !batchStatus) {
+                console.log(`🔄 Batch ${batchNumber} (${batchGuaranteedVar}) not ready: ${batchStatus}`);
+                return false;
+            }
+        }
+        console.log(`✅ All required batches ready: [${requiredBatches.join(', ')}]`);
+        return true;
+    };
+
+    const isPlayAbleToRunWithoutCustomVars = (play: Play): boolean => {
+        // NEW BATCH-BASED SYSTEM: Check if required batches are available
+        const requiredBatches = getRequiredBatchesForPlay(play);
+        const batchesAvailable = areBatchesAvailable(requiredBatches);
+        
+        // Must have basic LinkedIn profile data (Batch 1) at minimum
+        const hasProfile = !!linkedInProfile;
+        const isLoading = isLinkedinProfileDataLoading;
+        
+        // Additional check: for final plays, ensure we have at least LinkedIn profile batch ready
+        const linkedInBatchReady = allData.linkedin_profile_guaranteed === 'complete';
+        
+        const canRun = hasProfile && !isLoading && batchesAvailable && linkedInBatchReady;
+        
+        // DEBUG: Log detailed execution decision
+        console.log(`🎯 ${play.name} execution check:`, {
+            hasProfile,
+            isLoading,
+            requiredBatches,
+            batchesAvailable,
+            linkedInBatchReady,
+            canRun,
+            guaranteedVars: Object.keys(allData).filter(k => k.includes('guaranteed')).map(k => [k, allData[k]])
+        });
+        
+        return canRun;
+    };
+
+    // This effect monitors URL changes and handles profile navigation
+    useEffect(() => {
+        const processUrl = async () => {
+            if (!url) return;
+
+            const host = new URL(url).host;
+            if (!host.includes("linkedin.com") && !host.includes("hubspot.com"))
+                return;
+
+            const processUsername = (username: string | undefined, metadata?: any) => {
+                if (username && username !== currentUsername) {
+                    // COMPLETELY reset all state
+                    client.clear();
+
+                    // Reset state variables
+                    setCurrentUsername(username);
+                    setSelectedPlay(undefined);
+                    setSmartVariablesData({});
+                    setPlayResponses({});
+                    attemptsRef.current = {};
+
+                    // IMPORTANT: Reset manual research flag when navigating to a new profile
+                    setHasManuallyResearched(false);
+                    setExecutionCount(0); // Reset circuit breaker
+                    client.setQueryData(["linkedin-profiles/", "POST"], null);
+
+                    setPendingTasks([]);
+                    setTotalTasksInitiated(0);
+                    
+                    // Reset extracted email from HubSpot
+                    setExtractedEmailFromHubSpot(undefined);
+
+                    // Store the LinkedIn URL if it came from email lookup
+                    if (metadata?.linkedInUrl && metadata?.fromEmail) {
+                        setLinkedInProfileFromEmail(metadata.linkedInUrl);
+                    } else {
+                        setLinkedInProfileFromEmail(null);
+                    }
+
+                    // Force reload by creating a slight delay - but only if auto-run is true
+                    if (autoRun) {
+                        setTimeout(() => {
+                            fetchLinkedInProfileData({profile_id: username});
+                        }, 100);
+                    }
+                }
+            };
+
+            if (isSalesNavigatorProfile(url)) {
+                await handleProfileExtraction(
+                    extractLinkedInProfileFromSalesNav,
+                    setIsScrapingProfile,
+                    processUsername,
+                );
+                return;
+            }
+
+            if (isHubSpotContactPage(url)) {
+                await handleHubSpotProfileExtraction(
+                    setIsScrapingProfile,
+                    processUsername,
+                    setLinkedInProfileFromEmail,
+                    setExtractedEmailFromHubSpot,
+                );
+                return;
+            }
+
+            // Handle regular LinkedIn profile pages
+            const username = getLinkedInUsernameFromUrl(url);
+            processUsername(username);
+        };
+
+        processUrl();
+    }, [url, currentUsername]); // Only depend on URL and currentUsername to avoid infinite loops
+
+    // This effect refetches Hubspot when LinkedIn profile changes
+    useEffect(() => {
+        if (linkedInProfile && linkedInProfile.profile_id === currentUsername) {
+            console.log("LinkedIn profile updated - refetching Hubspot data", {
+                profile_id: linkedInProfile.profile_id,
+                name: linkedin?.first_name,
+                auto_run: autoRun,
+                has_manually_researched: hasManuallyResearched
+            });
+
+            // Only refetch if we have explicitly requested research
+            if (shouldFetchData) {
+                refetchHubspotContactData();
+            }
+        }
+    }, [linkedInProfile?.profile_id, shouldFetchData, currentUsername]);
+
+    // Run the selected play when it changes
+    useEffect(() => {
+        if (selectedPlay) {
+            // Add the selected play to pending tasks
+            if (!pendingTasks.includes(selectedPlay.name)) {
+                setPendingTasks(prev => [...prev, selectedPlay.name]);
+                // Increment the total count if we're adding a new task
+                setTotalTasksInitiated(current => current + 1);
+            }
+            runPlay();
+        }
+    }, [selectedPlay]);
+
+    useEffect(() => {
+        // If no pending tasks, nothing to do
+        if (pendingTasks.length === 0) return;
+
+        // Set a timeout to clear any task that stays pending too long
+        const timeoutId = setTimeout(() => {
+            console.log("Some tasks were pending too long, forcing cleanup:", pendingTasks);
+            // Force clear all pending tasks after timeout
+            setPendingTasks([]);
+        }, 10000); // 10 seconds timeout
+
+        // Clean up timeout if component unmounts or pendingTasks changes
+        return () => clearTimeout(timeoutId);
+    }, [pendingTasks]);
+
+    // Helper function to extract variable names from a template string (same as analytics)
+    const extractVariables = (template?: string): string[] => {
+        if (!template) return [];
+        const variableRegex = /\{([^{}]+)\}/g;
+        const matches = template.match(variableRegex) || [];
+        return matches
+            .map(match => match.slice(1, -1)) // Remove { and }
+            .filter(variable =>
+                !variable.startsWith('prompt_') &&
+                variable !== 'linkedin' &&
+                variable !== 'hubspot'
+            );
+    };
+
+    // Check if research play has all its required variables available (turns "green")
+    const isResearchPlayReadyToRun = (play: Play): boolean => {
+        // Must have basic LinkedIn profile data at minimum
+        const hasProfile = !!linkedInProfile;
+        const isLoading = isLinkedinProfileDataLoading;
+        
+        if (!hasProfile || isLoading) {
+            return false;
+        }
+
+        // Extract all required variables from play templates
+        const requiredVariables: string[] = [];
+        play.play_steps?.forEach(step => {
+            const systemVars = extractVariables(step.system_instructions_template);
+            const userVars = extractVariables(step.user_instructions_template);
+            [...systemVars, ...userVars].forEach(variable => {
+                if (!requiredVariables.includes(variable)) {
+                    requiredVariables.push(variable);
+                }
+            });
+        });
+
+        // Check if ALL required variables are available in allData
+        const missingVariables = requiredVariables.filter(variable => {
+            // Skip guaranteed variables - they're just signals, not actual data
+            if (variable.includes('_guaranteed')) return false;
+            
+            // Check if variable exists and has a valid value in allData
+            const value = allData[variable];
+            return !value || value === '' || value === 'nothing' || value.includes('⛔️');
+        });
+
+        const canRun = missingVariables.length === 0;
+
+        // DEBUG: Log detailed execution decision with actual values
+        console.log(`🎯 RESEARCH ${play.name} execution check:`, {
+            requiredVariables: requiredVariables.slice(0, 8), // Show first 8
+            missingVariables: missingVariables.slice(0, 5), // Show first 5 missing
+            totalRequired: requiredVariables.length,
+            totalMissing: missingVariables.length,
+            canRun: canRun ? '✅ READY' : '❌ WAITING',
+            // Show actual values for first few required variables
+            sampleValues: requiredVariables.slice(0, 5).map(v => [v, allData[v] ? 'HAS_VALUE' : 'MISSING'])
+        });
+
+        return canRun;
+    };
+
+    // This effect executes research plays as batches complete
+    useEffect(() => {
+        console.log('🔥 BATCH COMPLETION CHECK:', { 
+            shouldFetchData, 
+            researchPlaysCount: smartVariablesDataInitial.length, 
+            executionCount,
+            batchStatus: {
+                linkedin: allData.linkedin_profile_guaranteed,
+                company: allData.company_enrichment_guaranteed,
+                hubspot: allData.hubspot_guaranteed,
+                posts: allData.linkedin_posts_guaranteed,
+                jobs: allData.linkedin_jobs_guaranteed
+            }
+        });
+        
+        // Circuit breaker - prevent infinite executions
+        if (executionCount >= maxExecutions) {
+            console.log('🚨 Circuit breaker activated - too many executions, stopping to prevent infinite loops');
+            return;
+        }
+        
+        // Skip if research is not enabled
+        if (!shouldFetchData) {
+            console.log('❌ Skipping research execution - shouldFetchData is false');
+            return;
+        }
+        
+        console.log('✅ Checking which research plays are now ready to run...');
+        setExecutionCount(prev => prev + 1);
+
+        // Here we do a one-time count of plays with values
+        // This happens only once when the effect first runs
+        if (totalTasksInitiated === 0) {
+            // Count plays with non-empty values
+            const completedPlayCount = smartVariablesDataInitial.filter(
+                play => play.visible &&
+                    play.value !== null &&
+                    play.value !== undefined &&
+                    play.value !== "nothing"
+            ).length;
+
+            // Set the initial count
+            if (completedPlayCount > 0) {
+                setTotalTasksInitiated(completedPlayCount);
+                console.log(`Adding ${completedPlayCount} pre-existing values to total count`);
+            }
+        }
+
+        // Filter ONLY research plays that need execution (NO messaging plays)
+        console.log('🎯 Starting research play filtering with', smartVariablesDataInitial.length, 'total research plays');
+        
+        // SPECIFIC DEBUG: Check Sports play (should only need "summary")
+        const sportsPlay = smartVariablesDataInitial.find(p => p.name === 'Sports');
+        if (sportsPlay) {
+            console.log('🏈 SPORTS PLAY DEBUG:', {
+                name: sportsPlay.name,
+                visible: sportsPlay.visible,
+                output_type: sportsPlay.output_type,
+                isReadyToRun: isResearchPlayReadyToRun(sportsPlay),
+                hasSummary: !!allData.summary,
+                summaryValue: allData.summary ? allData.summary.slice(0, 50) + '...' : 'MISSING'
+            });
+        }
+        
+        const dataToFetch = smartVariablesDataInitial.filter(
+            (play) => {
+                // CRITICAL: Only process research plays, never messaging plays
+                if (play.output_type !== 'variable') {
+                    console.log(`❌ Skipping ${play.name} - not a research play (output_type: ${play.output_type})`);
+                    return false;
+                }
+
+                // Get current value first before using it
+                const currentValue = smartVariablesData[play.name];
+
+                // IMPLEMENT COUNTER TO DETECT HOW MANY TIMES WE TRIED A PLAY
+                // RESET COUNTER FOR ERROR VALUES TO ALLOW RETRY
+                if (currentValue === "⛔️ error") {
+                    attemptsRef.current[play.name] = 0;
+                }
+                if ((attemptsRef.current[play.name] || 0) >= 3) {
+                    console.log(`❌ Skipping ${play.name} - too many attempts`);
+                    return false; // Skip if we've tried too many times
+                }
+
+                // Skip if this play is already pending execution
+                if (pendingTasks.includes(play.name)) {
+                    console.log(`❌ Skipping ${play.name} - already pending`);
+                    return false;
+                }
+
+                // Skip if we already have valid research results
+                const alreadyHasResearch = isValidSmartVariableValue(currentValue) && currentValue !== "⛔️ error";
+                if (alreadyHasResearch) {
+                    console.log(`❌ Skipping ${play.name} - already has results`);
+                    return false;
+                }
+                
+                // Check if this research play is ready to run (has all required variables)
+                const canRun = play.visible && isResearchPlayReadyToRun(play);
+
+                console.log(`${canRun ? '✅' : '❌'} ${play.name}: ${canRun ? 'READY TO RUN' : 'WAITING FOR DATA'}`);
+
+                // If we're going to run it, increment the counter
+                if (canRun) {
+                    attemptsRef.current[play.name] = (attemptsRef.current[play.name] || 0) + 1;
+                    console.log(`🚀 WILL EXECUTE ${play.name} (attempt ${attemptsRef.current[play.name]})`);
+                }
+
+                return canRun;
+            }
+        );
+
+        console.log('🎯 Research filtering complete:', {
+            totalPlays: smartVariablesDataInitial.length,
+            playsToFetch: dataToFetch.length,
+            playNames: dataToFetch.map(play => play.name)
+        });
+
+        if (dataToFetch.length > 0) {
+            console.log('Adding the following tasks to PendingTasks:', dataToFetch.map(play => play.name));
+            setPendingTasks(current => [...current, ...dataToFetch.map(play => play.name)]);
+            setTotalTasksInitiated(current => current + dataToFetch.length);
+        } else {
+            console.log('❌ No research plays to execute - all plays were filtered out');
+            console.log('🔍 First few plays and their statuses:');
+            smartVariablesDataInitial.slice(0, 5).forEach((play, i) => {
+                console.log(`  ${i+1}. ${play.name}: visible=${play.visible}, value="${play.value}", hasValue=${!!play.value && play.value !== "nothing"}`);
+            });
+        }
+
+        // Execute plays sequentially to avoid state corruption
+        const executePlaySequentially = async (plays: typeof dataToFetch) => {
+            for (const play of plays) {
+                if (isResearchStopped) break; // Stop if research was stopped
+                
+                console.log(`🚀 Executing research play: ${play.name}`);
+                setIsLoadingSmartVariablesFinal(true);
+                
+                try {
+                    const res = await runSmartPlay({
+                        external_data: allData,
+                        persona_data: personaData,
+                        playId: play.id,
+                    });
+                    
+                    // DEBUG: Log the actual API response structure
+                    console.log(`🔍 API RESPONSE DEBUG for ${play.name}:`, res);
+                    console.log(`🔍 Response type:`, typeof res);
+                    console.log(`🔍 Response structure:`, Object.keys(res || {}));
+                    
+                    // Extract the actual response value (handle different response structures)
+                    let responseValue;
+                    if (Array.isArray(res)) {
+                        responseValue = res[0] || "⛔️ error";
+                    } else if (res && typeof res === 'object' && 'response' in res) {
+                        responseValue = (res as any).response;
+                    } else if (res && typeof res === 'object' && 'value' in res) {
+                        responseValue = (res as any).value;
+                    } else if (typeof res === 'string') {
+                        responseValue = res;
+                    } else {
+                        responseValue = "⛔️ error";
+                    }
+                    
+                    const next = {[play.name]: responseValue};
+                    setSmartVariablesData((current) => ({...current, ...next}));
+
+                    console.log(`✅ Research play completed: ${play.name} = ${responseValue?.slice(0, 100)}...`);
+                    
+                } catch (error) {
+                    console.error(`Error running play ${play.name}:`, error);
+                    
+                    // Check if it's a network connection error
+                    const errorMessage = error instanceof Error ? error.message : String(error);
+                    if (errorMessage.includes('CONNECTION_REFUSED') || 
+                        errorMessage.includes('fetch') ||
+                        errorMessage.includes('WebSocket')) {
+                        // Backend connection issue - set specific error
+                        setSmartVariablesData((current) => ({
+                            ...current, 
+                            [play.name]: "⛔️ Backend connection error"
+                        }));
+                    } else {
+                        // Set general error state for this play
+                        setSmartVariablesData((current) => ({
+                            ...current, 
+                            [play.name]: "⛔️ error"
+                        }));
+                    }
+                } finally {
+                    setPendingTasks(current => current.filter(task => task !== play.name));
+                    setIsLoadingSmartVariablesFinal(false);
+                    
+                    // Small delay between plays to prevent overwhelming the system
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+            }
+        };
+        
+        if (dataToFetch.length > 0) {
+            executePlaySequentially(dataToFetch);
+        }
+    }, [
+        // Trigger whenever any batch completes (guaranteed variables change)
+        shouldFetchData,
+        smartVariablesDataInitial.length,
+        allData.linkedin_profile_guaranteed,      // Batch 1 complete
+        allData.company_enrichment_guaranteed,    // Batch 2 complete  
+        allData.hubspot_guaranteed,               // Batch 3 complete
+        allData.linkedin_posts_guaranteed,        // Batch 4 complete
+        allData.linkedin_jobs_guaranteed,         // Batch 5 complete
+        Object.keys(smartVariablesData).join(','), // Current research results
+        // Note: Each time a batch completes, we check ALL research plays to see which ones are now ready
+    ]);
+
+
+
+    // Actions
+    const runPlay = async () => {
+        if (
+            !selectedPlay ||
+            !currentUsername ||
+            !isPlayAbleToRunWithoutCustomVars(selectedPlay)
+        )
+            return;
+
+        try {
+            // Process all data to resolve nested variables
+            const processedData = prepareDataForPlay(cleanDataForLLM(allData)); // Clean only for final LLM calls
+
+            const data = await _runPlay({
+                external_data: processedData,
+                persona_data: personaData,
+                playId: selectedPlay.id,
+            });
+
+            setPlayResponses((r) => ({...r, [selectedPlay.id]: data}));
+
+            // Remove from pending tasks after successful completion
+            setPendingTasks(current => current.filter(task => task !== selectedPlay.name));
+        } catch (error) {
+            console.error("Error running play:", error);
+            // Remove from pending tasks even on error
+            setPendingTasks(current => current.filter(task => task !== selectedPlay.name));
+        }
+    };
+
+    const setCustomVariable = (key: string, value: string) => {
+        setCustomVariables((prev) => ({
+            ...prev,
+            [key]: value,
+        }));
+    };
+
+    const refreshCRMData = () => {
+        client.clear();
+        attemptsRef.current = {};
+
+        smartVariablesDataInitial
+        .filter((play) => {
+            return (
+                !isPlayAbleToRunWithoutCustomVars(play) ||
+                keysForPlay(play).some((key) => key.startsWith("hubspot_"))
+            );
+        })
+        .forEach((k) =>
+            setSmartVariablesData((data) => {
+                const copy = {...data};
+                delete copy[k.name];
+                return copy;
+            }),
+        );
+    };
+
+    // NEW: Stop research function
+    const stopResearch = () => {
+        console.log("🛑 Stopping all research...");
+        setIsResearchStopped(true);
+        setPendingTasks([]);
+        setIsLoadingSmartVariablesFinal(false);
+        attemptsRef.current = {};
+        
+        // Reset after a short delay to allow new research to start if needed
+        setTimeout(() => {
+            setIsResearchStopped(false);
+        }, 1000);
+    };
+
+    const loading =
+        loadingContact ||
+        loadingDeal ||
+        loadingEmployees ||
+        isFetchingHubspotEmployeesData ||
+        loadingHubspotCompany ||
+        isLinkedinProfileDataLoading ||
+        isLoadingVariables ||
+        isLoadingSmartVariables ||
+        isLoadingResearchPlays ||
+        isLoadingPlays ||
+        isFetchingHubspotContactData ||
+        isFetchingHubspotDealData ||
+        isFetchingHubspotCompanyData ||
+        // NEW: Add loading states for new data sources
+        isLoadingCompanyEnrichment ||
+        isLoadingLinkedInPosts ||
+        isLoadingLinkedInJobs;
+
+    const loadingUI =
+        loading || isLoadingSmartVariablesFinal || isScrapingProfile || pendingTasks.length > 0;
+    console.log('Pending tasks:', pendingTasks);
+
+    const error =
+        linkedinProfileDataError ||
+        errorSmartVariables ||
+        errorResearchPlays ||
+        errorVariables ||
+        errorPlays;
+
+    // Filter smart variables
+    const initial: Record<string, string> = {};
+    smartVariablesDataInitial.forEach((play) => {
+        if (play.visible) {
+            initial[play.name] = play.value || ""; // Convert null to empty string
+        }
+    });
+    const combined = {...initial, ...smartVariablesData};
+    // Include ALL research plays (even empty ones) so they show in UI and can be populated
+    const filteredSmartVariables = combined;
+
+    // Debug: Log smart variables filtering
+    console.log('🔍 Smart Variables Filtering Debug:', {
+        initial: Object.keys(initial).length,
+        smartVariablesData: Object.keys(smartVariablesData).length,
+        combined: Object.keys({...initial, ...smartVariablesData}).length,
+        filteredSmartVariables: Object.keys(filteredSmartVariables).length,
+        smartVariablesDataEntries: Object.entries(smartVariablesData),
+        filteredEntries: Object.entries(filteredSmartVariables)
+    });
+
+    // DEBUG: Show actual research data values
+    console.log('🎯 ACTUAL RESEARCH DATA:', smartVariablesData);
+    console.log('🎯 RESEARCH DATA KEYS:', Object.keys(smartVariablesData));
+    Object.entries(smartVariablesData).forEach(([name, value]) => {
+        console.log(`🎯 ${name}:`, value?.slice(0, 100) + '...');
+    });
+
+    const totalResearchPlays = smartVariablesDataInitial.filter(play => play.visible && play.output_type === 'variable').length;
+    const completedResearchPlays = Object.keys(smartVariablesData).filter(key => {
+        const value = smartVariablesData[key];
+        return value && value !== "" && value !== "nothing" && !value.includes("⛔️");
+    }).length;
+
+    return {
+        selectedPlay,
+        setSelectedPlay,
+        playResponses,
+        autoRun,
+        setAutoRun,
+        currentUsername,
+        showCopiedOnIndex,
+        setShowCopiedOnIndex,
+        linkedInProfile,
+        didDoResearch,
+        fetchLinkedInProfileData: fetchLinkedInProfileDataWithTracking,
+        plays,
+        detectedPersonaName,
+        allData,
+        personaData,
+        isPlayAbleToRunWithoutCustomVars,
+        keysForPlay,
+        runPlay,
+        setCustomVariable,
+        refreshCRMData,
+        stopResearch,
+        loading,
+        loadingUI,
+        error,
+        runError,
+        isLoadingRun,
+        filteredSmartVariables,
+        rawResearchPlays: smartVariablesDataInitial.map(play => {
+            const currentValue = smartVariablesData[play.name] || "";
+            const isPending = pendingTasks.includes(play.name);
+            const hasError = currentValue === "⛔️ error";
+            const isComplete = currentValue && currentValue !== "" && !hasError;
+            
+            let status: 'ready' | 'loading' | 'complete' | 'error' = 'ready';
+            if (isPending) status = 'loading';
+            else if (hasError) status = 'error';
+            else if (isComplete) status = 'complete';
+            
+            return {
+                name: play.name,
+                value: currentValue,
+                status,
+                requiredVariables: play.play_steps ? keysForPlay(play) : []
+            };
+        }),
+        profile,
+        isScrapingProfile,
+        linkedInProfileFromEmail,
+        hasManuallyResearched,
+        setHasManuallyResearched,
+        pendingTasks,
+        totalTasksInitiated,
+        totalResearchPlays,
+        completedResearchPlays,
+        extractedEmailFromHubSpot,
+    };
+}

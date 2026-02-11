@@ -1,0 +1,8 @@
+{
+  "buildCommand": "next build",
+  "framework": "nextjs",
+  "installCommand": "npm install",
+  "cleanUrls": true,
+  "trailingSlash": false
+}
+

@@ -1,0 +1,118 @@
+{
+  "name": "prompt-workbench-fe",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "scripts": {
+    "dev": "run-p dev:*",
+    "dev:plasmo": "plasmo dev --verbose",
+    "dev:next": "next dev",
+    "build": "next build",
+    "build:all": "run-p build:*",
+    "build:plasmo": "plasmo build",
+    "build:next": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "pretty": "prettier --write \"./**/*.{js,jsx,ts,tsx,json,scss}\"",
+    "analyze-build": "node scripts/analyze-build.js",
+    "analyze-build:dev": "node scripts/analyze-build.js dev",
+    "analyze-build:prod": "node scripts/analyze-build.js prod"
+  },
+  "manifest": {
+    "permissions": [
+      "tabs",
+      "activeTab",
+      "scripting"
+    ],
+    "host_permissions": [
+      "*://prompt-workbench-be-751bd9fb40e6.herokuapp.com/*",
+      "*://prompt-workbench-fe.vercel.app/*",
+      "http://localhost/*",
+      "*://*.linkedin.com/*",
+      "*://*.hubspot.com/*"
+    ],
+    "name": "Narrative AI",
+    "description": "Quickly research prospects and write personalized emails without leaving your browser!",
+    "version": "48.2",
+    "update_url": "https://clients2.google.com/service/update2/crx",
+    "minimum_chrome_version": "88.0.0",
+    "background": {
+      "service_worker": "background.js",
+      "type": "module"
+    },
+    "content_security_policy": {
+      "extension_pages": "script-src 'self'; object-src 'self';"
+    }
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "dependencies": {
+    "@headlessui/react": "2.2.9",
+    "@hello-pangea/dnd": "16.6.0",
+    "@nangohq/frontend": "^0.69.29",
+    "@nangohq/node": "^0.69.29",
+    "@phosphor-icons/react": "2.1.10",
+    "@tailwindcss/forms": "0.5.10",
+    "@tanstack/react-query": "5.90.5",
+    "@types/papaparse": "5.3.16",
+    "axios": "1.12.2",
+    "classnames": "2.5.1",
+    "clsx": "2.1.1",
+    "framer-motion": "^12.34.0",
+    "js-cookie": "3.0.5",
+    "lodash": "4.17.21",
+    "lucide-react": "^0.563.0",
+    "marked": "15.0.12",
+    "next": "16.0.7",
+    "nuqs": "2.7.3",
+    "papaparse": "5.5.3",
+    "plasmo": "0.90.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-hook-form": "7.65.0",
+    "react-markdown": "9.1.0",
+    "remark-gfm": "4.0.1",
+    "sharp": "^0.34.5",
+    "swr": "2.3.6",
+    "utility-types": "3.11.0"
+  },
+  "devDependencies": {
+    "@plasmohq/rps": "1.8.7",
+    "@plasmohq/storage": "1.15.0",
+    "@tanstack/react-query-devtools": "5.90.2",
+    "@types/chrome": "0.0.263",
+    "@types/js-cookie": "3.0.6",
+    "@types/lodash": "4.17.20",
+    "@types/node": "20.19.23",
+    "@types/react": "18.3.26",
+    "@types/react-beautiful-dnd": "13.1.8",
+    "@types/react-dom": "18.3.7",
+    "autoprefixer": "10.4.21",
+    "eslint": "8.57.1",
+    "eslint-config-next": "15.5.6",
+    "eslint-config-prettier": "9.1.2",
+    "npm-run-all": "4.1.5",
+    "path-browserify": "1.0.1",
+    "postcss": "8.5.6",
+    "prettier": "3.6.2",
+    "tailwindcss": "3.4.18",
+    "typescript": "5.9.3",
+    "url": "0.11.4"
+  },
+  "optionalDependencies": {
+    "@parcel/watcher-darwin-x64": "^2.5.6",
+    "lightningcss-darwin-x64": "^1.31.1"
+  }
+}
